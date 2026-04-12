@@ -1,17 +1,26 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM python:3.10-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip git ffmpeg libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+ENV COQUI_TOS_AGREED=1
+ENV TTS_HOME=/tmp/tts
+ENV HF_HOME=/tmp/hf
+ENV XDG_CACHE_HOME=/tmp/.cache
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    curl \
+    libsndfile1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
 
-COPY handler.py /app/handler.py
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r /app/requirements.txt
 
-CMD ["python3", "-u", "handler.py"]
+COPY . /app
+
+CMD ["python", "-u", "handler.py"]
