@@ -2,6 +2,7 @@ import os
 import uuid
 import tempfile
 import traceback
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,8 +36,10 @@ def guess_extension_from_url(url: str) -> str:
         return ".ogg"
     if path.endswith(".webm"):
         return ".webm"
+    if path.endswith(".mp4"):
+        return ".mp4"
 
-    return ".wav"
+    return ".bin"
 
 
 def upload_to_supabase(local_path: str, object_path: str, content_type: str = "audio/wav"):
@@ -84,6 +87,36 @@ def download_file(url: str, out_path: str):
     print(f"✅ Download completato: {out_path} ({os.path.getsize(out_path)} bytes)", flush=True)
 
 
+def convert_audio_to_wav(input_path: str, output_path: str):
+    print(f"🎚 Conversione audio -> WAV: {input_path}", flush=True)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "24000",
+        "-ac", "1",
+        output_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Conversione ffmpeg fallita.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("Conversione WAV fallita: file output assente")
+
+    if os.path.getsize(output_path) < 1000:
+        raise RuntimeError("Conversione WAV fallita: file output troppo piccolo")
+
+    print(f"✅ WAV pronto: {output_path} ({os.path.getsize(output_path)} bytes)", flush=True)
+
+
 def handler(job):
     job_input = job.get("input", {}) or {}
 
@@ -95,28 +128,44 @@ def handler(job):
     print(f"🚀 Job Ultra avviato | token={token}", flush=True)
 
     if not text:
-        return {"error": "text mancante", "token": token}
+        return {
+            "ok": False,
+            "error": "text mancante",
+            "token": token
+        }
 
     if not voice_sample_url:
-        return {"error": "voice_sample_url mancante", "token": token}
+        return {
+            "ok": False,
+            "error": "voice_sample_url mancante",
+            "token": token
+        }
 
     tmp_dir = tempfile.mkdtemp(prefix=f"xtts_{token}_")
-    sample_ext = guess_extension_from_url(voice_sample_url)
-    sample_path = str(Path(tmp_dir) / f"voice_sample{sample_ext}")
+
+    original_ext = guess_extension_from_url(voice_sample_url)
+    downloaded_sample_path = str(Path(tmp_dir) / f"voice_sample_original{original_ext}")
+    normalized_sample_path = str(Path(tmp_dir) / "voice_sample_normalized.wav")
     output_path = str(Path(tmp_dir) / "dubbed_audio.wav")
 
     try:
-        download_file(voice_sample_url, sample_path)
+        download_file(voice_sample_url, downloaded_sample_path)
 
-        if os.path.getsize(sample_path) < 1000:
-            return {"error": "campione voce non valido o troppo piccolo", "token": token}
+        if os.path.getsize(downloaded_sample_path) < 1000:
+            return {
+                "ok": False,
+                "error": "campione voce non valido o troppo piccolo",
+                "token": token
+            }
+
+        convert_audio_to_wav(downloaded_sample_path, normalized_sample_path)
 
         print("🎙 Genero audio clonato...", flush=True)
 
         tts.tts_to_file(
             text=text,
             file_path=output_path,
-            speaker_wav=sample_path,
+            speaker_wav=normalized_sample_path,
             language=language,
             split_sentences=True
         )
@@ -124,10 +173,18 @@ def handler(job):
         print("✅ Generazione XTTS completata", flush=True)
 
         if not os.path.exists(output_path):
-            return {"error": "audio non creato", "token": token}
+            return {
+                "ok": False,
+                "error": "audio non creato",
+                "token": token
+            }
 
         if os.path.getsize(output_path) < 5000:
-            return {"error": "audio creato troppo piccolo", "token": token}
+            return {
+                "ok": False,
+                "error": "audio creato troppo piccolo",
+                "token": token
+            }
 
         object_path = f"{token}/dubbed_audio.wav"
         dubbed_audio_url = upload_to_supabase(output_path, object_path, "audio/wav")
