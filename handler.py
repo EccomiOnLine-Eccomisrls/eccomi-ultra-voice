@@ -22,6 +22,7 @@ MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 HTTP_TIMEOUT = 300
+SILENCE_MS_BETWEEN_CHUNKS = 220
 
 print(f"🔄 Carico XTTS v2 su {DEVICE}...", flush=True)
 tts = TTS(MODEL_NAME).to(DEVICE)
@@ -131,6 +132,30 @@ def convert_audio_to_wav(input_path: str, output_path: str):
     print(f"✅ WAV pronto: {output_path} ({os.path.getsize(output_path)} bytes)", flush=True)
 
 
+def make_silence_wav(output_path: str, duration_ms: int = 220):
+    duration_s = max(duration_ms, 0) / 1000.0
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f", "lavfi",
+        "-i", f"anullsrc=r=24000:cl=mono",
+        "-t", str(duration_s),
+        "-acodec", "pcm_s16le",
+        output_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Creazione pausa fallita.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("File pausa non creato")
+
+
 # =====================================================
 # TEXT CLEANING FOR XTTS
 # =====================================================
@@ -149,7 +174,7 @@ def normalize_text_for_xtts(text: str) -> str:
         "‘": "'",
         "“": '"',
         "”": '"',
-        "…": ".",
+        "…": " ",
         "–": ",",
         "—": ",",
         ";": ",",
@@ -160,6 +185,12 @@ def normalize_text_for_xtts(text: str) -> str:
         "‟": "",
         "•": ",",
         "|": ",",
+        "(": ", ",
+        ")": " ",
+        "[": ", ",
+        "]": " ",
+        "{": ", ",
+        "}": " ",
     }
 
     for old, new in replacements.items():
@@ -173,13 +204,15 @@ def normalize_text_for_xtts(text: str) -> str:
     text = text.replace('"', "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n+", " ", text)
+
     text = re.sub(r"[.]{2,}", ".", text)
     text = re.sub(r"[!]{2,}", "!", text)
     text = re.sub(r"[?]{2,}", "?", text)
     text = re.sub(r"[,]{2,}", ",", text)
+
     text = re.sub(r"\s+([,.;!?])", r"\1", text)
     text = re.sub(r"([,.;!?])([^\s])", r"\1 \2", text)
-    text = re.sub(r"\s*\.\s*", ". ", text)
+
     text = re.sub(r"\s*,\s*", ", ", text)
     text = re.sub(r"\s+", " ", text).strip()
 
@@ -220,12 +253,16 @@ def split_text_for_xtts(text: str, max_chars: int = 180) -> list[str]:
 
     cleaned = []
     for s in sentences:
-        s = s.strip(" ,")
+        s = s.strip()
+
         if not s:
             continue
-        if s[-1] not in ".!?":
-            s += "."
-        cleaned.append(s)
+
+        # toglie punteggiatura finale che XTTS a volte legge come parola
+        s = re.sub(r"[.!?,:;]+$", "", s).strip()
+
+        if s:
+            cleaned.append(s)
 
     return cleaned
 
@@ -241,8 +278,11 @@ def synthesize_sentences_to_wav(sentences: list[str], speaker_wav: str, language
         chunk_path = str(work_dir / f"chunk_{idx:03d}.wav")
         print(f"🧩 XTTS chunk {idx}/{len(sentences)}: {sentence}", flush=True)
 
+        tts_sentence = sentence.strip()
+        tts_sentence = re.sub(r"[.!?,:;]+$", "", tts_sentence).strip()
+
         tts.tts_to_file(
-            text=sentence,
+            text=tts_sentence,
             file_path=chunk_path,
             speaker_wav=speaker_wav,
             language=language,
@@ -255,10 +295,17 @@ def synthesize_sentences_to_wav(sentences: list[str], speaker_wav: str, language
         chunk_paths.append(chunk_path)
 
     concat_list_path = str(work_dir / "concat_list.txt")
+
     with open(concat_list_path, "w", encoding="utf-8") as f:
-        for p in chunk_paths:
+        for idx, p in enumerate(chunk_paths):
             safe_p = p.replace("\\", "/").replace("'", r"'\''")
             f.write(f"file '{safe_p}'\n")
+
+            if idx < len(chunk_paths) - 1 and SILENCE_MS_BETWEEN_CHUNKS > 0:
+                silence_path = str(work_dir / f"silence_{idx:03d}.wav")
+                make_silence_wav(silence_path, SILENCE_MS_BETWEEN_CHUNKS)
+                safe_silence = silence_path.replace("\\", "/").replace("'", r"'\''")
+                f.write(f"file '{safe_silence}'\n")
 
     cmd = [
         "ffmpeg",
